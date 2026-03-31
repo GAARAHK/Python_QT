@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+# -*- coding: gbk -*-
+"""
+汇天 LIN 上位机控制软件 v1.0
+支持：版本查询 / 标定 / 循环测试 / 同步展开折叠 / 断电重启
+      标定中、循环测试、断电重启前自动发送「启用 LIN 控制」指令
+"""
+
+import sys
+import time
+from queue import Queue
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QHBoxLayout,
+    QGroupBox, QPushButton, QLabel, QComboBox,
+    QSpinBox, QTextEdit, QProgressBar, QStatusBar,
+    QMessageBox, QSizePolicy,
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
+from PyQt5.QtGui import QFont, QColor, QPalette, QTextCharFormat, QTextCursor
+
+import serial
+import serial.tools.list_ports
+
+# ─────────────────────────────────────────────
+#  协议常量
+# ─────────────────────────────────────────────
+RESP_LEN = 13          # 设备响应帧固定长度（字节）
+
+CMD_QUERY       = bytes([0x02, 0x00, 0x08, 0x00, 0x02])
+CMD_UNFOLD      = bytes([0x02, 0x08, 0x25, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
+CMD_FOLD        = bytes([0x02, 0x08, 0x25, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
+CMD_ENABLE_LIN  = bytes([0x02, 0x08, 0x29, 0x43, 0x48, 0x49, 0x4E, 0x41, 0x48, 0x51, 0x00, 0x00, 0x02])
+CMD_CALIBRATE   = bytes([0x02, 0x08, 0x24, 0x00, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
+CMD_POWER_CYCLE = bytes([0x02, 0x08, 0x24, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
+
+CALIB_POLL_MS   = 1500   # 标定期间状态查询间隔（毫秒）
+CALIB_TIMEOUT_S = 120    # 标定超时时间（秒）
+
+
+def make_loop_cmd(count: int) -> bytes:
+    """生成循环测试指令，count 范围 1~255"""
+    count = max(1, min(255, count))
+    return bytes([0x02, 0x08, 0x24, 0x00, 0x13, 0xB8, 0x0B, count, 0x00, 0x00, 0x00, 0x00, 0x02])
+
+
+def to_hex_str(data: bytes) -> str:
+    return ' '.join(f'{b:02X}' for b in data)
+
+
+# ─────────────────────────────────────────────
+#  串口工作线程
+# ─────────────────────────────────────────────
+class SerialWorker(QThread):
+    data_received  = pyqtSignal(bytes)
+    error_occurred = pyqtSignal(str)
+    port_opened    = pyqtSignal()
+
+    def __init__(self, port, baudrate, parent=None):
+        super().__init__(parent)
+        self.port     = port
+        self.baudrate = baudrate
+        self._running = False
+        self._serial  = None
+        self._queue   = Queue()
+
+    # ── 公开 API（可从主线程调用）──
+    def send(self, data):
+        if self._running:
+            self._queue.put(data)
+
+    def stop(self):
+        self._running = False
+        self.wait(3000)
+
+    # ── 线程主循环 ──
+    def run(self):
+        try:
+            self._serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.05,
+            )
+        except serial.SerialException as exc:
+            self.error_occurred.emit(f"无法打开串口 {self.port}: {exc}")
+            return
+
+        self._running = True
+        self.port_opened.emit()
+        rx_buf = b""
+
+        while self._running:
+            # 发送待发命令
+            while not self._queue.empty():
+                try:
+                    self._serial.write(self._queue.get_nowait())
+                    self._serial.flush()
+                except Exception as exc:
+                    self.error_occurred.emit(f"发送错误: {exc}")
+
+            # 接收数据
+            waiting = self._serial.in_waiting
+            if waiting:
+                rx_buf += self._serial.read(waiting)
+                rx_buf = self._parse_frames(rx_buf)
+            else:
+                self.msleep(10)
+
+        if self._serial and self._serial.is_open:
+            self._serial.close()
+
+    def _parse_frames(self, buf):
+        """提取所有完整的 13 字节响应帧（首尾均为 0x02）"""
+        while len(buf) >= RESP_LEN:
+            idx = buf.find(b'\x02')
+            if idx == -1:
+                return b""
+            if idx > 0:
+                buf = buf[idx:]
+            if len(buf) < RESP_LEN:
+                break
+            candidate = buf[:RESP_LEN]
+            if candidate[-1] == 0x02:
+                self.data_received.emit(bytes(candidate))
+                buf = buf[RESP_LEN:]
+            else:
+                buf = buf[1:]   # 非法帧，向前滑动一字节
+        return buf
+
+
+# ─────────────────────────────────────────────
+#  主窗口
+# ─────────────────────────────────────────────
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("汇天 LIN 上位机控制软件 v1.0")
+        self.setGeometry(100, 100, 980, 740)
+        self.setMinimumSize(840, 620)
+
+        self._worker       = None
+        self._connected    = False
+        self._calibrating  = False
+        self._calib_start  = 0.0
+
+        self._calib_timer = QTimer(self)
+        self._calib_timer.timeout.connect(self._on_calib_poll)
+
+        self._init_ui()
+        self._refresh_ports()
+        self._apply_connection_state(False)
+
+    # ═══════════════════════════════════════════
+    #  UI 构建
+    # ═══════════════════════════════════════════
+    def _init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        root.addWidget(self._make_serial_group())
+
+        body = QHBoxLayout()
+        body.setSpacing(8)
+
+        # ── 左列 ──
+        left_col = QVBoxLayout()
+        left_col.setSpacing(8)
+        left_col.addWidget(self._make_version_group())
+        left_col.addWidget(self._make_motion_group())
+        left_col.addWidget(self._make_calibration_group())
+        left_col.addStretch()
+        lw = QWidget()
+        lw.setLayout(left_col)
+
+        # ── 右列 ──
+        right_col = QVBoxLayout()
+        right_col.setSpacing(8)
+        right_col.addWidget(self._make_loop_group())
+        right_col.addWidget(self._make_power_group())
+        right_col.addWidget(self._make_lin_group())
+        right_col.addStretch()
+        rw = QWidget()
+        rw.setLayout(right_col)
+
+        body.addWidget(lw, 1)
+        body.addWidget(rw, 1)
+        root.addLayout(body)
+        root.addWidget(self._make_log_group(), 1)
+
+        self._statusbar = QStatusBar()
+        self.setStatusBar(self._statusbar)
+        self._statusbar.showMessage("就绪 — 未连接")
+
+    # ── 串口配置 ──────────────────────────────
+    def _make_serial_group(self):
+        g = QGroupBox("串口配置")
+        lay = QHBoxLayout(g)
+
+        lay.addWidget(QLabel("串口:"))
+        self._cb_port = QComboBox()
+        self._cb_port.setMinimumWidth(90)
+        lay.addWidget(self._cb_port)
+
+        self._btn_refresh = QPushButton("刷新")
+        self._btn_refresh.setFixedWidth(48)
+        self._btn_refresh.clicked.connect(self._refresh_ports)
+        lay.addWidget(self._btn_refresh)
+
+        lay.addSpacing(10)
+        lay.addWidget(QLabel("波特率:"))
+        self._cb_baud = QComboBox()
+        for b in ("9600", "19200", "38400", "57600", "115200", "230400"):
+            self._cb_baud.addItem(b)
+        self._cb_baud.setCurrentText("115200")
+        lay.addWidget(self._cb_baud)
+
+        lay.addStretch()
+
+        self._btn_connect = QPushButton("连 接")
+        self._btn_connect.setFixedWidth(80)
+        self._btn_connect.clicked.connect(self._toggle_connection)
+        lay.addWidget(self._btn_connect)
+
+        self._lbl_conn = QLabel("● 未连接")
+        self._lbl_conn.setFixedWidth(72)
+        lay.addWidget(self._lbl_conn)
+        return g
+
+    # ── 版本查询 ──────────────────────────────
+    def _make_version_group(self):
+        g = QGroupBox("版本查询")
+        lay = QHBoxLayout(g)
+
+        self._btn_ver = QPushButton("查询软件版本")
+        self._btn_ver.clicked.connect(self._query_version)
+        lay.addWidget(self._btn_ver)
+
+        lay.addWidget(QLabel("版本号:"))
+        self._lbl_ver = QLabel("— — —")
+        self._lbl_ver.setStyleSheet(
+            "font-weight: bold; color: #89b4fa; font-size: 13px;"
+        )
+        lay.addWidget(self._lbl_ver)
+        lay.addStretch()
+        return g
+
+    # ── 展开 / 折叠 ───────────────────────────
+    def _make_motion_group(self):
+        g = QGroupBox("展开 / 折叠控制")
+        lay = QHBoxLayout(g)
+
+        self._btn_unfold = QPushButton("▲  同步展开")
+        self._btn_unfold.setStyleSheet(self._bs("#3498db", "#2980b9"))
+        self._btn_unfold.clicked.connect(self._send_unfold)
+        lay.addWidget(self._btn_unfold)
+
+        self._btn_fold = QPushButton("▼  同步折叠")
+        self._btn_fold.setStyleSheet(self._bs("#e67e22", "#d35400"))
+        self._btn_fold.clicked.connect(self._send_fold)
+        lay.addWidget(self._btn_fold)
+        return g
+
+    # ── 标定 ──────────────────────────────────
+    def _make_calibration_group(self):
+        g = QGroupBox("标定")
+        lay = QVBoxLayout(g)
+
+        row = QHBoxLayout()
+        self._btn_calib = QPushButton("开始标定")
+        self._btn_calib.setStyleSheet(self._bs("#9b59b6", "#8e44ad"))
+        self._btn_calib.clicked.connect(self._start_calibration)
+        row.addWidget(self._btn_calib)
+
+        self._btn_stop_calib = QPushButton("停止")
+        self._btn_stop_calib.setFixedWidth(56)
+        self._btn_stop_calib.clicked.connect(lambda: self._stop_calibration(False))
+        row.addWidget(self._btn_stop_calib)
+
+        row.addWidget(QLabel("状态:"))
+        self._lbl_calib = QLabel("待机")
+        self._lbl_calib.setStyleSheet("font-weight: bold; color: #a6adc8;")
+        row.addWidget(self._lbl_calib)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self._calib_bar = QProgressBar()
+        self._calib_bar.setRange(0, CALIB_TIMEOUT_S)
+        self._calib_bar.setValue(0)
+        self._calib_bar.setFormat("等待标定…")
+        self._calib_bar.setTextVisible(True)
+        lay.addWidget(self._calib_bar)
+        return g
+
+    # ── 循环测试 ──────────────────────────────
+    def _make_loop_group(self):
+        g = QGroupBox("循环测试")
+        lay = QVBoxLayout(g)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("循环次数:"))
+        self._spin_loop = QSpinBox()
+        self._spin_loop.setRange(1, 255)
+        self._spin_loop.setValue(20)
+        self._spin_loop.setSuffix(" 次")
+        row.addWidget(self._spin_loop)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self._btn_loop = QPushButton("开始循环测试")
+        self._btn_loop.setStyleSheet(self._bs("#1abc9c", "#16a085"))
+        self._btn_loop.clicked.connect(self._send_loop)
+        lay.addWidget(self._btn_loop)
+        return g
+
+    # ── 断电重启 ──────────────────────────────
+    def _make_power_group(self):
+        g = QGroupBox("断电重启")
+        lay = QVBoxLayout(g)
+
+        tip = QLabel("?  重启后如需继续控制，下次指令将自动重新启用 LIN")
+        tip.setStyleSheet("color: #fab387; font-size: 11px;")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        self._btn_power = QPushButton("执行断电重启")
+        self._btn_power.setStyleSheet(self._bs("#e74c3c", "#c0392b"))
+        self._btn_power.clicked.connect(self._send_power_cycle)
+        lay.addWidget(self._btn_power)
+        return g
+
+    # ── LIN 控制 ──────────────────────────────
+    def _make_lin_group(self):
+        g = QGroupBox("LIN 控制")
+        lay = QVBoxLayout(g)
+
+        tip = QLabel(
+            "标定、循环测试、断电重启命令\n"
+            "前将自动发送「启用 LIN 控制」指令。"
+        )
+        tip.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        lay.addWidget(tip)
+
+        self._btn_lin = QPushButton("手动发送「启用 LIN 控制」")
+        self._btn_lin.clicked.connect(self._send_enable_lin)
+        lay.addWidget(self._btn_lin)
+        return g
+
+    # ── 通信日志 ──────────────────────────────
+    def _make_log_group(self):
+        g = QGroupBox("通信日志")
+        lay = QVBoxLayout(g)
+
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(QFont("Consolas", 9))
+        self._log.setStyleSheet(
+            "background-color: #1e1e2e; color: #cdd6f4;"
+            "border: 1px solid #45475a;"
+        )
+        lay.addWidget(self._log)
+
+        row = QHBoxLayout()
+        btn_clr = QPushButton("清除日志")
+        btn_clr.setFixedWidth(80)
+        btn_clr.clicked.connect(self._log.clear)
+        row.addWidget(btn_clr)
+        row.addStretch()
+        lay.addLayout(row)
+        return g
+
+    @staticmethod
+    def _bs(normal, hover):
+        """快速生成彩色按钮样式"""
+        return (
+            f"QPushButton {{ background-color: {normal}; color: white; "
+            f"font-weight: bold; border-radius: 4px; padding: 6px 14px; }}"
+            f"QPushButton:hover {{ background-color: {hover}; }}"
+            f"QPushButton:disabled {{ background-color: #45475a; color: #6c7086; }}"
+        )
+
+    # ═══════════════════════════════════════════
+    #  串口连接管理
+    # ═══════════════════════════════════════════
+    def _refresh_ports(self):
+        self._cb_port.clear()
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            self._cb_port.addItem(p.device)
+        if not ports:
+            self._cb_port.addItem("(无可用串口)")
+
+    def _toggle_connection(self):
+        if self._connected:
+            self._do_disconnect()
+        else:
+            self._do_connect()
+
+    def _do_connect(self):
+        port = self._cb_port.currentText()
+        if not port or port.startswith("("):
+            QMessageBox.warning(self, "提示", "请先选择有效的串口")
+            return
+        baud = int(self._cb_baud.currentText())
+        self._worker = SerialWorker(port, baud, self)
+        self._worker.port_opened.connect(lambda: self._apply_connection_state(True))
+        self._worker.data_received.connect(self._on_data_received)
+        self._worker.error_occurred.connect(self._on_serial_error)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.start()
+        self._log_msg(f"正在连接 {port} @ {baud} bps…", "info")
+
+    def _do_disconnect(self):
+        self._stop_calibration(False)
+        if self._worker:
+            self._worker.stop()
+
+    def _on_worker_finished(self):
+        self._stop_calibration(False)
+        self._apply_connection_state(False)
+        self._log_msg("串口已断开", "warning")
+        self._worker = None
+
+    def _on_serial_error(self, msg):
+        self._log_msg(f"[串口错误] {msg}", "error")
+
+    def _apply_connection_state(self, on: bool):
+        if on == self._connected:
+            return
+        self._connected = on
+
+        # 连接/断开 按钮
+        if on:
+            self._btn_connect.setText("断开连接")
+            self._btn_connect.setStyleSheet(
+                "QPushButton { background-color: #f38ba8; color: white; "
+                "font-weight: bold; border-radius: 4px; padding: 4px; }"
+                "QPushButton:hover { background-color: #c0392b; }"
+            )
+            self._lbl_conn.setText("● 已连接")
+            self._lbl_conn.setStyleSheet("color: #a6e3a1; font-weight: bold;")
+            self._log_msg(f"已连接到 {self._cb_port.currentText()}", "success")
+            self._statusbar.showMessage(f"已连接: {self._cb_port.currentText()}")
+        else:
+            self._btn_connect.setText("连 接")
+            self._btn_connect.setStyleSheet(
+                "QPushButton { background-color: #a6e3a1; color: #1e1e2e; "
+                "font-weight: bold; border-radius: 4px; padding: 4px; }"
+                "QPushButton:hover { background-color: #1abc9c; }"
+            )
+            self._lbl_conn.setText("● 未连接")
+            self._lbl_conn.setStyleSheet("color: #f38ba8; font-weight: bold;")
+            self._statusbar.showMessage("未连接")
+
+        # 串口选择控件跟随连接状态
+        self._cb_port.setEnabled(not on)
+        self._cb_baud.setEnabled(not on)
+        self._btn_refresh.setEnabled(not on)
+
+        # 功能按钮
+        for btn in (
+            self._btn_ver, self._btn_unfold, self._btn_fold,
+            self._btn_calib, self._btn_loop, self._btn_power, self._btn_lin,
+        ):
+            btn.setEnabled(on)
+
+        # 停止标定按钮：仅标定进行中才启用
+        self._btn_stop_calib.setEnabled(on and self._calibrating)
+
+    # ═══════════════════════════════════════════
+    #  发送命令
+    # ═══════════════════════════════════════════
+    def _send(self, cmd, label):
+        if not (self._worker and self._worker.isRunning()):
+            self._log_msg("串口未连接，无法发送命令", "error")
+            return
+        self._worker.send(cmd)
+        self._log_msg(f"TX [{label}]  {to_hex_str(cmd)}", "tx")
+
+    def _send_with_lin(self, cmd, label):
+        """自动前置「启用 LIN 控制」指令"""
+        self._send(CMD_ENABLE_LIN, "启用LIN控制")
+        self._send(cmd, label)
+
+    def _query_version(self):
+        self._send(CMD_QUERY, "查询版本")
+
+    def _send_unfold(self):
+        self._send(CMD_UNFOLD, "同步展开")
+
+    def _send_fold(self):
+        self._send(CMD_FOLD, "同步折叠")
+
+    def _send_enable_lin(self):
+        self._send(CMD_ENABLE_LIN, "启用LIN控制")
+
+    def _start_calibration(self):
+        if self._calibrating:
+            return
+        self._calibrating  = True
+        self._calib_start  = time.monotonic()
+
+        self._calib_bar.setValue(0)
+        self._calib_bar.setFormat("标定中…")
+        self._lbl_calib.setText("标定中…")
+        self._lbl_calib.setStyleSheet("font-weight: bold; color: #f9e2af;")
+        self._btn_calib.setEnabled(False)
+        self._btn_stop_calib.setEnabled(True)
+        self._statusbar.showMessage("标定进行中…")
+
+        # 先发启用 LIN，再发标定指令
+        self._send_with_lin(CMD_CALIBRATE, "标定")
+        # 启动轮询定时器
+        self._calib_timer.start(CALIB_POLL_MS)
+        self._log_msg(
+            f"标定已启动，每 {CALIB_POLL_MS/1000:.1f}s 查询一次状态，"
+            f"超时 {CALIB_TIMEOUT_S}s",
+            "info",
+        )
+
+    def _stop_calibration(self, success: bool):
+        if not self._calibrating:
+            return
+        self._calibrating = False
+        self._calib_timer.stop()
+        self._btn_calib.setEnabled(self._connected)
+        self._btn_stop_calib.setEnabled(False)
+        if not success:
+            self._lbl_calib.setText("已停止")
+            self._lbl_calib.setStyleSheet("font-weight: bold; color: #a6adc8;")
+            self._statusbar.showMessage("标定已停止")
+
+    def _on_calib_poll(self):
+        elapsed = int(time.monotonic() - self._calib_start)
+        self._calib_bar.setValue(min(elapsed, CALIB_TIMEOUT_S))
+        self._calib_bar.setFormat(f"标定中… {elapsed}s / {CALIB_TIMEOUT_S}s")
+        self._send(CMD_QUERY, "查询状态")
+
+        if elapsed >= CALIB_TIMEOUT_S:
+            self._stop_calibration(False)
+            self._lbl_calib.setText("超时!")
+            self._lbl_calib.setStyleSheet("font-weight: bold; color: #f38ba8;")
+            self._log_msg(
+                f"标定超时（已等待 {CALIB_TIMEOUT_S}s），请检查设备", "error"
+            )
+
+    def _on_calibration_done(self):
+        self._calib_bar.setValue(CALIB_TIMEOUT_S)
+        self._calib_bar.setFormat("标定完成 ?")
+        self._lbl_calib.setText("标定完成 ?")
+        self._lbl_calib.setStyleSheet("font-weight: bold; color: #a6e3a1;")
+        self._stop_calibration(True)
+        self._statusbar.showMessage("标定完成")
+        self._log_msg("? 标定成功完成！设备状态: 空闲", "success")
+        QMessageBox.information(self, "标定完成", "设备标定已成功完成！")
+
+    def _send_loop(self):
+        count = self._spin_loop.value()
+        self._send_with_lin(make_loop_cmd(count), f"循环测试 × {count}")
+
+    def _send_power_cycle(self):
+        ret = QMessageBox.question(
+            self, "确认操作",
+            "确定要执行断电重启吗？\n（重启后将自动在下次操作前重新启用 LIN 控制）",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ret == QMessageBox.Yes:
+            self._send_with_lin(CMD_POWER_CYCLE, "断电重启")
+            self._log_msg(
+                "断电重启命令已发送。下次需要控制时请重新操作，"
+                "软件将自动重新启用 LIN 控制。",
+                "warning",
+            )
+
+    # ═══════════════════════════════════════════
+    #  接收数据解析
+    # ═══════════════════════════════════════════
+    def _on_data_received(self, data: bytes):
+        self._log_msg(f"RX  {to_hex_str(data)}", "rx")
+
+        if len(data) != RESP_LEN:
+            return
+
+        # 响应类型识别：
+        #   byte[3] == 0x00  →  状态响应（byte[4] 为状态码，0x01=空闲）
+        #   byte[3] 为可打印字符 →  版本信息响应
+        if data[3] == 0x00:
+            status = data[4]
+            status_desc = "空闲" if status == 0x01 else f"0x{status:02X}"
+            self._log_msg(f"设备状态码: {status_desc}", "info")
+            if self._calibrating and status == 0x01:
+                self._on_calibration_done()
+        else:
+            ver = "".join(chr(b) for b in data[3:11] if 0x20 <= b <= 0x7E)
+            if ver:
+                self._lbl_ver.setText(ver)
+                self._log_msg(f"软件版本: {ver}", "success")
+
+    # ═══════════════════════════════════════════
+    #  通信日志
+    # ═══════════════════════════════════════════
+    _LOG_COLORS = {
+        "tx":      "#89b4fa",   # 蓝 — 发送
+        "rx":      "#a6e3a1",   # 绿 — 接收
+        "error":   "#f38ba8",   # 红
+        "warning": "#fab387",   # 橙
+        "success": "#a6e3a1",   # 绿
+        "info":    "#cdd6f4",   # 白
+    }
+
+    def _log_msg(self, msg: str, level: str = "info"):
+        ts     = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
+        color  = self._LOG_COLORS.get(level, "#cdd6f4")
+        cursor = self._log.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(f"[{ts}] {msg}\n")
+        self._log.setTextCursor(cursor)
+        self._log.ensureCursorVisible()
+
+    # ═══════════════════════════════════════════
+    #  关闭事件
+    # ═══════════════════════════════════════════
+    def closeEvent(self, event):
+        self._do_disconnect()
+        super().closeEvent(event)
+
+
+# ─────────────────────────────────────────────
+#  程序入口
+# ─────────────────────────────────────────────
+def _apply_dark_palette(app: QApplication):
+    palette = QPalette()
+    c = {
+        "window":    QColor(30,  33,  46),
+        "text":      QColor(205, 214, 244),
+        "base":      QColor(24,  24,  37),
+        "altbase":   QColor(30,  33,  46),
+        "button":    QColor(49,  50,  68),
+        "highlight": QColor(137, 180, 250),
+        "hitext":    QColor(30,  30,  46),
+        "disabled":  QColor(108, 112, 134),
+    }
+    palette.setColor(QPalette.Window,          c["window"])
+    palette.setColor(QPalette.WindowText,      c["text"])
+    palette.setColor(QPalette.Base,            c["base"])
+    palette.setColor(QPalette.AlternateBase,   c["altbase"])
+    palette.setColor(QPalette.ToolTipBase,     c["window"])
+    palette.setColor(QPalette.ToolTipText,     c["text"])
+    palette.setColor(QPalette.Text,            c["text"])
+    palette.setColor(QPalette.Button,          c["button"])
+    palette.setColor(QPalette.ButtonText,      c["text"])
+    palette.setColor(QPalette.BrightText,      QColor(255, 255, 255))
+    palette.setColor(QPalette.Highlight,       c["highlight"])
+    palette.setColor(QPalette.HighlightedText, c["hitext"])
+    palette.setColor(QPalette.Disabled, QPalette.ButtonText, c["disabled"])
+    palette.setColor(QPalette.Disabled, QPalette.Text,       c["disabled"])
+    app.setPalette(palette)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    _apply_dark_palette(app)
+
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
