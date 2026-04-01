@@ -341,7 +341,7 @@ _APP_CFG = AppConfig()
 class RingProgressWidget(QWidget):
     """可自定义颜色/文字的环形进度控件（0-100），支持旋转加载动画。"""
 
-    def __init__(self, size=120, parent=None):
+    def __init__(self, size=200, parent=None):
         super().__init__(parent)
         self._size      = size
         self._value     = 0
@@ -591,11 +591,11 @@ class ControlPage(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
         self._btn_calib_start = PrimaryPushButton(FIF.PLAY, "开始标定")
-        self._btn_calib_start.setMinimumHeight(54)
+        self._btn_calib_start.setMinimumHeight(100)
         self._btn_calib_start.clicked.connect(self._start_calibration)
         btn_row.addWidget(self._btn_calib_start, 3)
         self._btn_calib_stop = PushButton(FIF.PAUSE, "停止标定")
-        self._btn_calib_stop.setMinimumHeight(54)
+        self._btn_calib_stop.setMinimumHeight(100)
         self._btn_calib_stop.clicked.connect(self._stop_calibration_action)
         btn_row.addWidget(self._btn_calib_stop, 2)
         lay.addLayout(btn_row)
@@ -661,11 +661,11 @@ class ControlPage(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
         self._btn_loop_start = PrimaryPushButton(FIF.PLAY, "开始运行")
-        self._btn_loop_start.setMinimumHeight(54)
+        self._btn_loop_start.setMinimumHeight(100)
         self._btn_loop_start.clicked.connect(self._start_loop)
         btn_row.addWidget(self._btn_loop_start, 3)
         self._btn_loop_stop = PushButton(FIF.PAUSE, "停止运行")
-        self._btn_loop_stop.setMinimumHeight(54)
+        self._btn_loop_stop.setMinimumHeight(100)
         self._btn_loop_stop.clicked.connect(self._stop_loop_action)
         btn_row.addWidget(self._btn_loop_stop, 2)
         lay.addLayout(btn_row)
@@ -691,7 +691,7 @@ class ControlPage(QWidget):
         tip1.setStyleSheet("color: #718096;")
         lay.addWidget(tip1)
         self._btn_unload = PrimaryPushButton(FIF.DOWN, "下  料")
-        self._btn_unload.setMinimumHeight(54)
+        self._btn_unload.setMinimumHeight(100)
         self._btn_unload.clicked.connect(self._send_unload)
         lay.addWidget(self._btn_unload)
 
@@ -701,7 +701,7 @@ class ControlPage(QWidget):
         tip2.setStyleSheet("color: #718096;")
         lay.addWidget(tip2)
         self._btn_home = PushButton(FIF.UP, "回到原位")
-        self._btn_home.setMinimumHeight(54)
+        self._btn_home.setMinimumHeight(100)
         self._btn_home.clicked.connect(self._send_home)
         lay.addWidget(self._btn_home)
 
@@ -712,7 +712,7 @@ class ControlPage(QWidget):
         tip3.setStyleSheet("color: #ef4444;")
         lay.addWidget(tip3)
         self._btn_emergency = PushButton(FIF.POWER_BUTTON, "紧急停止")
-        self._btn_emergency.setMinimumHeight(54)
+        self._btn_emergency.setMinimumHeight(100)
         self._btn_emergency.setStyleSheet(
             "PushButton{background:#ef4444;color:white;border-radius:6px;border:none;}"
             "PushButton:hover{background:#dc2626;}"
