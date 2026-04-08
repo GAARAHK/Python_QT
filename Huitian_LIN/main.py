@@ -57,10 +57,10 @@ CMD_POWER_CYCLE     = bytes([0x02, 0x08, 0x24, 0x00, 0x31, 0x00, 0x00, 0x00, 0x0
 
 CALIB_POLL_MS    = 2000
 CALIB_TIMEOUT_S  = 120
-LOOP_POLL_MS     = 30000
+LOOP_POLL_MS     = 1000
 
 RESP_CMD_STATUS    = 0x06
-RESP_CMD_INNER_VER = 0x00
+RESP_CMD_INNER_VER = 0x07
 RESP_CMD_OUTER_VER = 0x08
 
 _THEME_COLORS = [
@@ -740,6 +740,7 @@ class ControlPage(QWidget):
         lay.addLayout(t)
         lay.addWidget(_sep())
 
+        # ── 外部版本 ──
         r1 = QHBoxLayout()
         r1.addWidget(CaptionLabel("外部版本"))
         r1.addStretch()
@@ -748,6 +749,18 @@ class ControlPage(QWidget):
         r1.addWidget(self._lbl_ver_outer)
         lay.addLayout(r1)
 
+        r1b = QHBoxLayout()
+        r1b.addSpacing(8)
+        r1b.addWidget(CaptionLabel("期望:"))
+        self._lbl_ver_outer_exp = CaptionLabel(_APP_CFG.get("exp_outer_ver") or "未设置")
+        self._lbl_ver_outer_exp.setStyleSheet("color: #718096;")
+        r1b.addWidget(self._lbl_ver_outer_exp)
+        r1b.addStretch()
+        self._lbl_ver_outer_match = CaptionLabel("")
+        r1b.addWidget(self._lbl_ver_outer_match)
+        lay.addLayout(r1b)
+
+        # ── 内部版本 ──
         r2 = QHBoxLayout()
         r2.addWidget(CaptionLabel("内部版本"))
         r2.addStretch()
@@ -755,6 +768,17 @@ class ControlPage(QWidget):
         self._lbl_ver_inner.setStyleSheet("color: #3b82f6;")
         r2.addWidget(self._lbl_ver_inner)
         lay.addLayout(r2)
+
+        r2b = QHBoxLayout()
+        r2b.addSpacing(8)
+        r2b.addWidget(CaptionLabel("期望:"))
+        self._lbl_ver_inner_exp = CaptionLabel(_APP_CFG.get("exp_inner_ver") or "未设置")
+        self._lbl_ver_inner_exp.setStyleSheet("color: #718096;")
+        r2b.addWidget(self._lbl_ver_inner_exp)
+        r2b.addStretch()
+        self._lbl_ver_inner_match = CaptionLabel("")
+        r2b.addWidget(self._lbl_ver_inner_match)
+        lay.addLayout(r2b)
 
         lay.addWidget(_sep())
         br = QHBoxLayout()
@@ -908,10 +932,10 @@ class ControlPage(QWidget):
         self._send(cmd, label)
 
     def _query_version_outer(self):
-        self._send(CMD_QUERY_VER, "查询外部版本")
+        self._send_with_lin(CMD_QUERY_VER, "查询外部版本")
 
     def _query_version_inner(self):
-        self._send(CMD_QUERY_INNER_VER, "查询内部版本")
+        self._send_with_lin(CMD_QUERY_INNER_VER, "查询内部版本")
 
     def _send_unfold(self):
         self._send(CMD_UNFOLD, "同步展开")
@@ -944,6 +968,8 @@ class ControlPage(QWidget):
         if not (self._worker and self._worker.isRunning()):
             log("串口未连接，无法发送命令", "error")
             return
+        self._worker.send(CMD_ENABLE_LIN)
+        log(f"TX [紧急停止-启用LIN]  {to_hex(CMD_ENABLE_LIN)}", "tx")
         self._worker.send(CMD_POWER_CYCLE)
         log(f"TX [紧急停止]  {to_hex(CMD_POWER_CYCLE)}", "tx")
         InfoBar.error(
@@ -1025,15 +1051,28 @@ class ControlPage(QWidget):
         self._ring_calib.setValue(100)
         self._ring_calib.setText("完成")
         self._ring_calib.setRingColor(QColor("#22c55e"))
-        self._calib_caption.setText("标定完成 ?")
-        self._lbl_calib_status.setText("完成 ?")
+        self._calib_caption.setText("标定完成")
+        self._lbl_calib_status.setText("完成")
         self._lbl_calib_status.setStyleSheet("color: #38a169; font-weight: bold;")
         self._stop_calib_internal(True)
-        log("? 标定成功完成！", "success")
+        log("标定成功完成！", "success")
         InfoBar.success(
             title="标定完成", content="设备标定已成功完成！",
             orient=Qt.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP, duration=4000, parent=self,
+        )
+
+    def _on_calibration_failed(self):
+        self._ring_calib.setRingColor(QColor("#ef4444"))
+        self._calib_caption.setText("标定失败，请检查设备")
+        self._lbl_calib_status.setText("失败")
+        self._lbl_calib_status.setStyleSheet("color: #e53e3e; font-weight: bold;")
+        self._stop_calib_internal(False)
+        log("标定失败！", "error")
+        InfoBar.error(
+            title="标定失败", content="设备返回标定失败状态，请检查设备。",
+            orient=Qt.Horizontal, isClosable=True,
+            position=InfoBarPosition.TOP, duration=5000, parent=self,
         )
 
     # ── 循环运行 ──────────────────────────────────
@@ -1121,11 +1160,11 @@ class ControlPage(QWidget):
         log(f"循环进度: {current} / {target}", "info")
         if current >= target:
             self._loop_bar.setValue(100)
-            self._lbl_loop_status.setText("运行结束 ?")
+            self._lbl_loop_status.setText("运行结束")
             self._lbl_loop_status.setStyleSheet("color: #38a169; font-weight: bold;")
-            self._loop_caption.setText("循环运行结束 ?")
+            self._loop_caption.setText("循环运行结束")
             self._stop_loop_internal(True, current)
-            log(f"? 循环运行结束，共完成 {current} 次", "success")
+            log(f"循环运行结束，共完成 {current} 次", "success")
             InfoBar.success(
                 title="循环运行结束",
                 content=f"已完成全部 {current} 次循环！",
@@ -1142,45 +1181,73 @@ class ControlPage(QWidget):
         cmd_byte = data[2]
 
         if cmd_byte == RESP_CMD_STATUS:
-            calib_st = data[4]
-            loop_cnt = data[5] | (data[6] << 8)
-            calib_map = {0: "未标定", 1: "标定中", 2: "标定成功"}
+            # byte[7]=标定状态, byte[8~9]=循环次数(小端)
+            calib_st = data[7]
+            loop_cnt = data[8] | (data[9] << 8)
+            calib_map = {0: "未标定", 1: "标定中", 2: "标定成功", 3: "标定失败"}
             log(f"状态: 标定={calib_map.get(calib_st, hex(calib_st))}  循环次数={loop_cnt}", "info")
-            if self._calibrating and calib_st == 2:
-                self._on_calibration_done()
+            if self._calibrating:
+                if calib_st == 2:
+                    self._on_calibration_done()
+                elif calib_st == 3:
+                    self._on_calibration_failed()
             if self._loop_running:
                 self._on_loop_count_update(loop_cnt)
 
         elif cmd_byte == RESP_CMD_INNER_VER:
-            ver = "".join(chr(b) for b in data[3:10] if 0x20 <= b <= 0x7E)
+            # byte[4]=0x33前缀, byte[5:11]=6位版本数字 → "1.4.1.004"
+            raw = "".join(chr(b) for b in data[5:11] if 0x30 <= b <= 0x39)
+            if len(raw) >= 6:
+                ver = f"{raw[0]}.{raw[1]}.{raw[2]}.{raw[3:6]}"
+            elif len(raw) >= 3:
+                ver = f"{raw[0]}.{raw[1]}.{raw[2]}"
+            else:
+                ver = raw
             if ver:
                 exp = _APP_CFG.get("exp_inner_ver").strip()
+                self._lbl_ver_inner_exp.setText(exp if exp else "未设置")
                 if exp:
                     if ver == exp:
-                        self._lbl_ver_inner.setText(ver + " ?")
+                        self._lbl_ver_inner.setText(ver)
                         self._lbl_ver_inner.setStyleSheet("color: #22c55e; font-weight: bold;")
+                        self._lbl_ver_inner_match.setText("√ 一致")
+                        self._lbl_ver_inner_match.setStyleSheet("color: #22c55e; font-weight: bold;")
                     else:
-                        self._lbl_ver_inner.setText(f"{ver}  ≠{exp} ?")
+                        self._lbl_ver_inner.setText(ver)
                         self._lbl_ver_inner.setStyleSheet("color: #ef4444; font-weight: bold;")
+                        self._lbl_ver_inner_match.setText("× 不符")
+                        self._lbl_ver_inner_match.setStyleSheet("color: #ef4444; font-weight: bold;")
                 else:
                     self._lbl_ver_inner.setText(ver)
                     self._lbl_ver_inner.setStyleSheet("color: #3b82f6;")
+                    self._lbl_ver_inner_match.setText("")
                 log(f"内部版本: {ver}", "success")
 
         elif cmd_byte == RESP_CMD_OUTER_VER:
-            ver = "".join(chr(b) for b in data[3:11] if 0x20 <= b <= 0x7E)
+            # byte[4]=0x33前缀, byte[5:8]=3位版本数字 → "1.4.1"
+            raw = "".join(chr(b) for b in data[5:8] if 0x30 <= b <= 0x39)
+            if len(raw) >= 3:
+                ver = f"{raw[0]}.{raw[1]}.{raw[2]}"
+            else:
+                ver = raw
             if ver:
                 exp = _APP_CFG.get("exp_outer_ver").strip()
+                self._lbl_ver_outer_exp.setText(exp if exp else "未设置")
                 if exp:
                     if ver == exp:
-                        self._lbl_ver_outer.setText(ver + " ?")
+                        self._lbl_ver_outer.setText(ver)
                         self._lbl_ver_outer.setStyleSheet("color: #22c55e; font-weight: bold;")
+                        self._lbl_ver_outer_match.setText("√ 一致")
+                        self._lbl_ver_outer_match.setStyleSheet("color: #22c55e; font-weight: bold;")
                     else:
-                        self._lbl_ver_outer.setText(f"{ver}  ≠{exp} ?")
+                        self._lbl_ver_outer.setText(ver)
                         self._lbl_ver_outer.setStyleSheet("color: #ef4444; font-weight: bold;")
+                        self._lbl_ver_outer_match.setText("× 不符")
+                        self._lbl_ver_outer_match.setStyleSheet("color: #ef4444; font-weight: bold;")
                 else:
                     self._lbl_ver_outer.setText(ver)
                     self._lbl_ver_outer.setStyleSheet("color: #3b82f6;")
+                    self._lbl_ver_outer_match.setText("")
                 log(f"外部版本: {ver}", "success")
 
 
