@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QSizePolicy, QFrame, QLineEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QFileDialog,
+    QFileDialog, QMessageBox, QDoubleSpinBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QSettings, QDate
 from PyQt5.QtGui import QColor, QTextCharFormat, QTextCursor, QFont, QPainter, QPen, QBrush
@@ -54,14 +54,21 @@ CMD_FOLD            = bytes([0x02, 0x08, 0x25, 0x01, 0x00, 0x00, 0x00, 0x00, 0x0
 CMD_ENABLE_LIN      = bytes([0x02, 0x08, 0x29, 0x43, 0x48, 0x49, 0x4E, 0x41, 0x48, 0x51, 0x00, 0x00, 0x02])
 CMD_CALIBRATE       = bytes([0x02, 0x08, 0x24, 0x00, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
 CMD_POWER_CYCLE     = bytes([0x02, 0x08, 0x24, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
+CMD_QUERY_CURRENT   = bytes([0x02, 0x00, 0x01, 0x00, 0x02])
 
 CALIB_POLL_MS    = 2000
 CALIB_TIMEOUT_S  = 120
 LOOP_POLL_MS     = 1000
+TEST_POLL_MS     = 500
+TEST_TIMEOUT_S   = 120
+LOG_MAX_LINES    = 1500
+LOG_TRIM_TO      = 1000
+CURRENT_SCALE_A  = 0.001614557239479
 
 RESP_CMD_STATUS    = 0x06
 RESP_CMD_INNER_VER = 0x07
 RESP_CMD_OUTER_VER = 0x08
+RESP_CMD_CURRENT   = 0x01
 
 _THEME_COLORS = [
     ("默认蓝",  "#0078d4"),
@@ -87,6 +94,14 @@ def to_hex(data: bytes) -> str:
     return ' '.join(f'{b:02X}' for b in data)
 
 
+def sample_to_amp(sample: int) -> float:
+    return sample * CURRENT_SCALE_A
+
+
+def format_amp(value: float) -> str:
+    return f"{value:.3f} A"
+
+
 # ─────────────────────────────────────────────
 #  SQLite 数据库层
 # ─────────────────────────────────────────────
@@ -108,28 +123,58 @@ class TestDB:
                     end_time    TEXT    NOT NULL,
                     duration_s  REAL    NOT NULL,
                     loop_count  INTEGER NOT NULL,
-                    result      TEXT    NOT NULL
+                    result      TEXT    NOT NULL,
+                    m1_max      REAL,
+                    m2_max      REAL,
+                    m3_max      REAL,
+                    m4_max      REAL,
+                    total_max   REAL
                 )
             """)
+            # 兼容旧数据库：逐列添加电流峰值列
+            for _col in ("m1_max", "m2_max", "m3_max", "m4_max", "total_max"):
+                try:
+                    con.execute(f"ALTER TABLE test_records ADD COLUMN {_col} REAL")
+                except Exception:
+                    pass  # 列已存在
             con.execute("CREATE INDEX IF NOT EXISTS idx_qr ON test_records(qr_code)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_start ON test_records(start_time)")
             con.commit()
 
     @classmethod
-    def insert(cls, qr_code, start_time, end_time, duration_s, loop_count, result):
+    def insert(cls, qr_code, start_time, end_time, duration_s, loop_count, result,
+               m1_max=None, m2_max=None, m3_max=None, m4_max=None, total_max=None):
         with cls._conn() as con:
             con.execute(
                 "INSERT INTO test_records"
-                "(qr_code,start_time,end_time,duration_s,loop_count,result) "
-                "VALUES(?,?,?,?,?,?)",
-                (qr_code, start_time, end_time, duration_s, loop_count, result)
+                "(qr_code,start_time,end_time,duration_s,loop_count,result,"
+                "m1_max,m2_max,m3_max,m4_max,total_max) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (qr_code, start_time, end_time, duration_s, loop_count, result,
+                 m1_max, m2_max, m3_max, m4_max, total_max)
+            )
+            con.commit()
+
+    @classmethod
+    def insert_current(cls, qr_code, start_time, end_time, duration_s,
+                       m1_max, m2_max, m3_max, m4_max, result):
+        with cls._conn() as con:
+            con.execute(
+                "INSERT INTO current_tests"
+                "(qr_code,start_time,end_time,duration_s,m1_max,m2_max,m3_max,m4_max,result)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (qr_code, start_time, end_time, duration_s,
+                 m1_max, m2_max, m3_max, m4_max, result)
             )
             con.commit()
 
     @classmethod
     def query(cls, qr_code="", date_from="", date_to=""):
-        sql = ("SELECT id,qr_code,start_time,end_time,duration_s,loop_count,result "
-               "FROM test_records WHERE 1=1")
+        sql = (
+            "SELECT id,qr_code,start_time,end_time,duration_s,result,"
+            "m1_max,m2_max,m3_max,m4_max,total_max "
+            "FROM test_records WHERE 1=1"
+        )
         params = []
         if qr_code.strip():
             sql += " AND qr_code LIKE ?"
@@ -275,7 +320,23 @@ class LogBus(QFrame):
         cursor.setCharFormat(fmt)
         cursor.insertText(f"[{ts}] {msg}\n")
         self._log.setTextCursor(cursor)
+        self._trim_old_logs()
         self._log.ensureCursorVisible()
+
+    def _trim_old_logs(self):
+        doc = self._log.document()
+        excess = doc.blockCount() - LOG_MAX_LINES
+        if excess <= 0:
+            return
+        cursor = QTextCursor(doc)
+        for _ in range(excess):
+            cursor.movePosition(QTextCursor.Start)
+            cursor.select(QTextCursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
+        end_cursor = self._log.textCursor()
+        end_cursor.movePosition(QTextCursor.End)
+        self._log.setTextCursor(end_cursor)
 
     def clear(self):
         self._log.clear()
@@ -312,6 +373,16 @@ class AppConfig:
         "serial_baud":     "115200",
         "theme":           "auto",
         "theme_color":     "#0078d4",
+        "m1_min":          0.0,
+        "m1_max":          round(sample_to_amp(9999), 3),
+        "m2_min":          0.0,
+        "m2_max":          round(sample_to_amp(9999), 3),
+        "m3_min":          0.0,
+        "m3_max":          round(sample_to_amp(9999), 3),
+        "m4_min":          0.0,
+        "m4_max":          round(sample_to_amp(9999), 3),
+        "total_min":       0.0,
+        "total_max":       round(sample_to_amp(262140), 3),
     }
 
     def __init__(self):
@@ -323,6 +394,11 @@ class AppConfig:
         if isinstance(default, int):
             try:
                 return int(v)
+            except (TypeError, ValueError):
+                return default
+        if isinstance(default, float):
+            try:
+                return float(v)
             except (TypeError, ValueError):
                 return default
         return v if v is not None else default
@@ -509,6 +585,15 @@ class ControlPage(QWidget):
         self._loop_timer = QTimer(self)
         self._loop_timer.timeout.connect(self._on_loop_poll)
 
+        # 电流测试状态
+        self._testing         = False
+        self._test_start      = 0.0
+        self._test_start_dt   = None
+        self._test_tick       = 0
+        self._test_currents   = [[], [], [], [], []]
+        self._test_timer = QTimer(self)
+        self._test_timer.timeout.connect(self._on_test_poll)
+
         self._build()
         self._apply_connection_state(False)
 
@@ -533,6 +618,7 @@ class ControlPage(QWidget):
         main_row = QHBoxLayout()
         main_row.setSpacing(10)
         main_row.addWidget(self._build_calib_card(), 2)
+        main_row.addWidget(self._build_test_card(), 2)
         main_row.addWidget(self._build_loop_card(), 2)
         main_row.addWidget(self._build_action_card(), 1)
         root.addLayout(main_row)
@@ -601,6 +687,79 @@ class ControlPage(QWidget):
         lay.addLayout(btn_row)
         return card
 
+    # ── 电流测试卡片 ──────────────────────────────
+    def _build_test_card(self):
+        card = _card()
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(22, 16, 22, 16)
+        lay.setSpacing(8)
+
+        t = QHBoxLayout()
+        ico = ToolButton(FIF.SPEED_HIGH)
+        ico.setEnabled(False)
+        ico.setFixedSize(36, 36)
+        t.addWidget(ico)
+        t.addWidget(TitleLabel("电流测试"))
+        t.addStretch()
+        self._lbl_test_status = SubtitleLabel("待  机")
+        self._lbl_test_status.setStyleSheet("color: #718096;")
+        t.addWidget(self._lbl_test_status)
+        lay.addLayout(t)
+        lay.addWidget(_sep())
+
+        # 五路实时电流 + 最大值（含总电流）
+        motor_names = ["桨叶1", "桨叶2", "插销1", "插销2", "总电流"]
+        self._lbl_cur_rt  = []
+        self._lbl_cur_max = []
+        for mname in motor_names:
+            row = QHBoxLayout()
+            row.addWidget(CaptionLabel(mname))
+            row.addStretch()
+            rt = BodyLabel("--- A")
+            rt.setStyleSheet("color: #3b82f6;")
+            row.addWidget(rt)
+            self._lbl_cur_rt.append(rt)
+            row.addSpacing(8)
+            mx = BodyLabel("max:--- A")
+            mx.setStyleSheet("color: #718096;")
+            row.addWidget(mx)
+            self._lbl_cur_max.append(mx)
+            lay.addLayout(row)
+
+        lay.addWidget(_sep())
+
+        # 环形判定结果（居中，更大更醒目）
+        ring_h = QHBoxLayout()
+        ring_h.addStretch()
+        self._ring_test = RingProgressWidget(size=180)
+        self._ring_test.setRingColor(QColor("#718096"))
+        self._ring_test.setValue(0)
+        self._ring_test.setText("--")
+        ring_h.addWidget(self._ring_test)
+        ring_h.addStretch()
+        lay.addLayout(ring_h)
+
+        # 超时进度条
+        self._test_bar = ProgressBar()
+        self._test_bar.setRange(0, TEST_TIMEOUT_S)
+        self._test_bar.setValue(0)
+        self._test_bar.setFixedHeight(6)
+        lay.addWidget(self._test_bar)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        self._btn_test_start = PrimaryPushButton(FIF.PLAY, "开始测试")
+        self._btn_test_start.setMinimumHeight(100)
+        self._btn_test_start.clicked.connect(self._start_test)
+        btn_row.addWidget(self._btn_test_start, 3)
+        self._btn_test_stop = PushButton(FIF.PAUSE, "停止测试")
+        self._btn_test_stop.setMinimumHeight(100)
+        self._btn_test_stop.setEnabled(False)
+        self._btn_test_stop.clicked.connect(self._stop_test_action)
+        btn_row.addWidget(self._btn_test_stop, 2)
+        lay.addLayout(btn_row)
+        return card
+
     # ── 循环运行卡片 ───────────────────────────────
     def _build_loop_card(self):
         card = _card()
@@ -627,7 +786,7 @@ class ControlPage(QWidget):
         self._spin_loop.setRange(1, 255)
         self._spin_loop.setValue(_APP_CFG.get("loop_count"))
         self._spin_loop.setSuffix("  次")
-        self._spin_loop.setFixedWidth(120)
+        self._spin_loop.setFixedWidth(150)
         cr.addWidget(self._spin_loop)
         cr.addStretch()
         self._lbl_loop_cnt = SubtitleLabel("—  /  —")
@@ -869,6 +1028,7 @@ class ControlPage(QWidget):
 
     def on_disconnected(self):
         self._stop_calib_internal(False)
+        self._stop_test_internal(False)
         self._stop_loop_internal(False, 0)
         self._apply_connection_state(False)
         log("串口已断开", "warning")
@@ -881,8 +1041,9 @@ class ControlPage(QWidget):
 
     def _update_start_buttons(self):
         ok = bool(self._connected) and self._qr_scanned
-        self._btn_calib_start.setEnabled(ok and not self._loop_running)
-        self._btn_loop_start.setEnabled(ok and not self._calibrating)
+        self._btn_calib_start.setEnabled(ok and not self._loop_running and not self._testing)
+        self._btn_test_start.setEnabled(ok and not self._calibrating and not self._loop_running and not self._testing)
+        self._btn_loop_start.setEnabled(ok and not self._calibrating and not self._testing)
 
     # ── 连接状态 ──────────────────────────────────
     def _apply_connection_state(self, on: bool):
@@ -902,6 +1063,7 @@ class ControlPage(QWidget):
 
         self._btn_calib_stop.setEnabled(on and self._calibrating)
         self._btn_loop_stop.setEnabled(on and self._loop_running)
+        self._btn_test_stop.setEnabled(on and self._testing)
         self._update_start_buttons()
 
         if on:
@@ -993,6 +1155,7 @@ class ControlPage(QWidget):
         self._lbl_calib_status.setStyleSheet("color: #d97706; font-weight: bold;")
         self._btn_calib_start.setEnabled(False)
         self._btn_calib_stop.setEnabled(True)
+        self._btn_test_start.setEnabled(False)
         self._btn_loop_start.setEnabled(False)
         self._state_tooltip = StateToolTip("标定进行中", "请等待设备完成标定…", self)
         self._state_tooltip.move(self.width() // 2 - 150, 20)
@@ -1075,6 +1238,172 @@ class ControlPage(QWidget):
             position=InfoBarPosition.TOP, duration=5000, parent=self,
         )
 
+    # ── 电流测试逻辑 ──────────────────────────────
+    def _start_test(self):
+        if self._testing or self._calibrating or self._loop_running:
+            return
+        self._testing       = True
+        self._test_start    = time.monotonic()
+        self._test_start_dt = QDateTime.currentDateTime()
+        self._test_tick     = 0
+        self._test_currents = [[], [], [], [], []]
+        # 重置 UI
+        for i in range(5):
+            self._lbl_cur_rt[i].setText("--- A")
+            self._lbl_cur_rt[i].setStyleSheet("color: #3b82f6;")
+            self._lbl_cur_max[i].setText("max:--- A")
+            self._lbl_cur_max[i].setStyleSheet("color: #718096;")
+        self._ring_test.setRingColor(QColor("#d97706"))
+        self._ring_test.setValue(0)
+        self._ring_test.setText("测试中")
+        self._ring_test.setAnimating(True)
+        self._test_bar.setValue(0)
+        self._lbl_test_status.setText("测试中...")
+        self._lbl_test_status.setStyleSheet("color: #d97706; font-weight: bold;")
+        self._btn_test_start.setEnabled(False)
+        self._btn_test_stop.setEnabled(True)
+        self._btn_calib_start.setEnabled(False)
+        self._btn_loop_start.setEnabled(False)
+        # 发送 LIN + 循环1次
+        self._send_with_lin(make_loop_cmd(1), "测试-循环1次")
+        self._test_timer.start(TEST_POLL_MS)
+        log(f"电流测试已启动（循环1次，轮询间隔 {TEST_POLL_MS}ms，最长120s）", "info")
+
+    def _stop_test_internal(self, finished: bool, result: str = "中止", maxvals=None):
+        if not self._testing:
+            return
+        self._testing = False
+        self._test_timer.stop()
+        self._btn_test_stop.setEnabled(False)
+        self._save_test_record(result, maxvals if maxvals else [])
+        self._test_start_dt = None
+        self._update_start_buttons()
+
+    def _stop_test_action(self):
+        if not self._testing:
+            return
+        self._lbl_test_status.setText("已停止")
+        self._lbl_test_status.setStyleSheet("color: #718096;")
+        self._ring_test.setAnimating(False)
+        self._ring_test.setRingColor(QColor("#718096"))
+        self._ring_test.setText("已中止")
+        self._stop_test_internal(False, "中止")
+        self._send_with_lin(CMD_POWER_CYCLE, "停止测试-断电重启")
+        log("电流测试已中止，已发送断电重启", "warning")
+
+    def _on_test_poll(self):
+        elapsed_ms = int((time.monotonic() - self._test_start) * 1000)
+        elapsed = elapsed_ms // 1000
+        pct = int(elapsed_ms * 100 / (TEST_TIMEOUT_S * 1000))
+        self._test_bar.setValue(min(elapsed, TEST_TIMEOUT_S))
+        self._ring_test.setValue(min(pct, 100))
+        if elapsed_ms >= TEST_TIMEOUT_S * 1000:
+            self._lbl_test_status.setText("超  时")
+            self._lbl_test_status.setStyleSheet("color: #e53e3e; font-weight: bold;")
+            self._ring_test.setAnimating(False)
+            self._ring_test.setRingColor(QColor("#e53e3e"))
+            self._ring_test.setText("超时")
+            self._stop_test_internal(False, "超时")
+            log("电流测试超时（120s）", "error")
+            InfoBar.error(
+                title="测试超时", content="电流测试已超时，请检查设备连接。",
+                orient=Qt.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP, duration=5000, parent=self,
+            )
+            return
+        self._test_tick += 1
+        if self._test_tick % 2 == 1:
+            self._send(CMD_QUERY_CURRENT, "测试-查询电流")
+        else:
+            self._send(CMD_QUERY_STATUS, "测试-查询循环次数")
+
+    def _on_test_current(self, vals):
+        amp_vals = [sample_to_amp(v) for v in vals]
+        total_current = sum(amp_vals)
+        current_vals = amp_vals + [total_current]
+        for i, value_a in enumerate(current_vals):
+            self._test_currents[i].append(value_a)
+            self._lbl_cur_rt[i].setText(format_amp(value_a))
+        for i in range(5):
+            if self._test_currents[i]:
+                mx = max(self._test_currents[i])
+                self._lbl_cur_max[i].setText(f"max:{format_amp(mx)}")
+
+    def _on_test_loop_done(self, loop_cnt: int):
+        if not self._testing or loop_cnt < 1:
+            return
+        maxvals = [max(lst) if lst else 0 for lst in self._test_currents]
+        thresholds = [
+            (_APP_CFG.get("m1_min"), _APP_CFG.get("m1_max")),
+            (_APP_CFG.get("m2_min"), _APP_CFG.get("m2_max")),
+            (_APP_CFG.get("m3_min"), _APP_CFG.get("m3_max")),
+            (_APP_CFG.get("m4_min"), _APP_CFG.get("m4_max")),
+            (_APP_CFG.get("total_min"), _APP_CFG.get("total_max")),
+        ]
+        ok = all(lo <= maxvals[i] <= hi for i, (lo, hi) in enumerate(thresholds))
+        result = "OK" if ok else "NG"
+        # 更新最大值颜色
+        for i, (lo, hi) in enumerate(thresholds):
+            in_range = (lo <= maxvals[i] <= hi)
+            color = "#22c55e" if in_range else "#ef4444"
+            self._lbl_cur_max[i].setText(f"max:{format_amp(maxvals[i])}")
+            self._lbl_cur_max[i].setStyleSheet(f"color: {color}; font-weight: bold;")
+        self._ring_test.setAnimating(False)
+        self._ring_test.setValue(100)
+        if ok:
+            self._ring_test.setRingColor(QColor("#22c55e"))
+            self._ring_test.setText("OK")
+            self._lbl_test_status.setText("合  格")
+            self._lbl_test_status.setStyleSheet("color: #22c55e; font-weight: bold;")
+        else:
+            self._ring_test.setRingColor(QColor("#ef4444"))
+            self._ring_test.setText("NG")
+            self._lbl_test_status.setText("不合格")
+            self._lbl_test_status.setStyleSheet("color: #ef4444; font-weight: bold;")
+        self._test_bar.setValue(TEST_TIMEOUT_S)
+        self._stop_test_internal(True, result, maxvals)
+        # 测试完成后清除二维码，等待下次扫码
+        self._qr.clear_code()
+        self._qr_scanned = False
+        log(
+            f"电流测试完成: {result}  桨叶1={format_amp(maxvals[0])}  桨叶2={format_amp(maxvals[1])}"
+            f"  插销1={format_amp(maxvals[2])}  插销2={format_amp(maxvals[3])}  总电流={format_amp(maxvals[4])}",
+            "success"
+        )
+        if ok:
+            InfoBar.success(
+                title="测试合格 OK", content="电流在合格范围内，自动开始循环运行。",
+                orient=Qt.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP, duration=4000, parent=self,
+            )
+            QTimer.singleShot(800, self._start_loop)
+        else:
+            InfoBar.error(
+                title="测试不合格 NG", content="电流超出合格范围，请检查设备。",
+                orient=Qt.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP, duration=5000, parent=self,
+            )
+
+    def _save_test_record(self, result: str, maxvals=None):
+        if not self._test_start_dt:
+            return
+        start_str = self._test_start_dt.toString("yyyy-MM-dd HH:mm:ss")
+        end_dt    = QDateTime.currentDateTime()
+        end_str   = end_dt.toString("yyyy-MM-dd HH:mm:ss")
+        duration  = round(self._test_start_dt.secsTo(end_dt), 1)
+        qr = self._current_qr if hasattr(self, "_current_qr") and self._current_qr else "(未扫码)"
+        mvs = maxvals if maxvals else []
+        m1 = mvs[0] if len(mvs) > 0 else 0
+        m2 = mvs[1] if len(mvs) > 1 else 0
+        m3 = mvs[2] if len(mvs) > 2 else 0
+        m4 = mvs[3] if len(mvs) > 3 else 0
+        total = mvs[4] if len(mvs) > 4 else 0
+        try:
+            TestDB.insert(qr, start_str, end_str, duration, 0, result, m1, m2, m3, m4, total)
+            log(f"电流测试记录已保存: {qr}  {result}", "success")
+        except Exception as e:
+            log(f"保存电流测试记录失败: {e}", "error")
+
     # ── 循环运行 ──────────────────────────────────
     def _start_loop(self):
         if self._loop_running or self._calibrating:
@@ -1093,6 +1422,7 @@ class ControlPage(QWidget):
         self._btn_loop_start.setEnabled(False)
         self._btn_loop_stop.setEnabled(True)
         self._btn_calib_start.setEnabled(False)
+        self._btn_test_start.setEnabled(False)
         self._send_with_lin(make_loop_cmd(self._loop_target), f"循环测试 × {self._loop_target}")
         self._loop_timer.start(LOOP_POLL_MS)
         log(f"循环运行已启动，目标 {self._loop_target} 次，每 {LOOP_POLL_MS//1000}s 查询次数", "info")
@@ -1122,14 +1452,10 @@ class ControlPage(QWidget):
             self._lbl_loop_status.setText("已停止")
             self._lbl_loop_status.setStyleSheet("color: #718096;")
             self._loop_caption.setText("等待开始循环运行…")
-            self._save_loop_record("中止", actual_count)
         else:
             self._ring_loop.setValue(100)
             self._ring_loop.setText("完成")
             self._ring_loop.setRingColor(QColor("#22c55e"))
-            self._save_loop_record("完成", actual_count)
-            self._qr.clear_code()
-            self._qr_scanned = False
         self._loop_start_dt = None
         self._update_start_buttons()
 
@@ -1191,8 +1517,23 @@ class ControlPage(QWidget):
                     self._on_calibration_done()
                 elif calib_st == 3:
                     self._on_calibration_failed()
-            if self._loop_running:
+            if self._testing:
+                self._on_test_loop_done(loop_cnt)
+            elif self._loop_running:
                 self._on_loop_count_update(loop_cnt)
+
+        elif cmd_byte == RESP_CMD_CURRENT:
+            m1 = data[3] | (data[4] << 8)
+            m2 = data[5] | (data[6] << 8)
+            m3 = data[7] | (data[8] << 8)
+            m4 = data[9] | (data[10] << 8)
+            log(
+                f"电流: 桨叶1={format_amp(sample_to_amp(m1))}  桨叶2={format_amp(sample_to_amp(m2))}"
+                f"  插销1={format_amp(sample_to_amp(m3))}  插销2={format_amp(sample_to_amp(m4))}",
+                "info"
+            )
+            if self._testing:
+                self._on_test_current([m1, m2, m3, m4])
 
         elif cmd_byte == RESP_CMD_INNER_VER:
             # byte[4]=0x33前缀, byte[5:11]=6位版本数字 → "1.4.1.004"
@@ -1416,7 +1757,8 @@ class LogPage(QWidget):
 #  页面 4：测试记录查询
 # ═════════════════════════════════════════════
 class QueryPage(QWidget):
-    _COLS = ["ID", "二维码", "开始时间", "结束时间", "时长(s)", "循环次数", "结果"]
+    _COLS = ["ID", "二维码", "开始时间", "结束时间", "时长(s)", "结果",
+             "桨叶1峰值(A)", "桨叶2峰值(A)", "插销1峰值(A)", "插销2峰值(A)", "总电流峰值(A)"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1498,10 +1840,9 @@ class QueryPage(QWidget):
         stat_lay = QHBoxLayout(stat_card)
         stat_lay.setContentsMargins(20, 10, 20, 10)
         stat_lay.setSpacing(30)
-        self._lbl_stat_total   = self._make_stat(stat_lay, "总次数", "0")
-        self._lbl_stat_done    = self._make_stat(stat_lay, "完成",   "0", "#22c55e")
-        self._lbl_stat_aborted = self._make_stat(stat_lay, "中止",   "0", "#ef4444")
-        self._lbl_stat_avg     = self._make_stat(stat_lay, "平均时长", "—")
+        self._lbl_stat_total = self._make_stat(stat_lay, "总条数", "0")
+        self._lbl_stat_ok    = self._make_stat(stat_lay, "OK",    "0", "#22c55e")
+        self._lbl_stat_ng    = self._make_stat(stat_lay, "NG",    "0", "#ef4444")
         stat_lay.addStretch()
         root.addWidget(stat_card)
 
@@ -1516,7 +1857,7 @@ class QueryPage(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.setBorderVisible(True)
         self._table.setBorderRadius(8)
-        for i, w in enumerate([50, 180, 160, 160, 80, 80, 80]):
+        for i, w in enumerate([50, 180, 160, 160, 80, 80, 70, 70, 70, 70, 90]):
             self._table.setColumnWidth(i, w)
         root.addWidget(self._table, 1)
 
@@ -1568,26 +1909,31 @@ class QueryPage(QWidget):
             r = self._table.rowCount()
             self._table.insertRow(r)
             for c, val in enumerate(row):
-                item = QTableWidgetItem(str(val))
+                if c >= 6 and val is not None:
+                    display = f"{float(val):.3f}"
+                else:
+                    display = "" if val is None else str(val)
+                item = QTableWidgetItem(display)
                 item.setTextAlignment(Qt.AlignCenter)
-                if c == 6:
-                    if str(val) == "完成":
-                        item.setForeground(QColor("#22c55e"))
-                    elif str(val) == "中止":
-                        item.setForeground(QColor("#ef4444"))
+                if c == 5:
+                    color_map = {
+                        "OK": "#22c55e",
+                        "NG": "#ef4444", "超时": "#e53e3e",
+                        "中止": "#a0aec0",
+                    }
+                    col_hex = color_map.get(str(val))
+                    if col_hex:
+                        item.setForeground(QColor(col_hex))
                 self._table.setItem(r, c, item)
 
-        total   = len(rows)
-        done    = sum(1 for r in rows if r[6] == "完成")
-        aborted = sum(1 for r in rows if r[6] == "中止")
-        durs    = [r[4] for r in rows if r[4] is not None]
-        avg_dur = f"{sum(durs)/len(durs):.1f}s" if durs else "—"
+        total = len(rows)
+        ok    = sum(1 for r in rows if r[5] == "OK")
+        ng    = sum(1 for r in rows if r[5] == "NG")
 
         self._lbl_count.setText(f"共 {total} 条记录")
         self._lbl_stat_total.setText(str(total))
-        self._lbl_stat_done.setText(str(done))
-        self._lbl_stat_aborted.setText(str(aborted))
-        self._lbl_stat_avg.setText(avg_dur)
+        self._lbl_stat_ok.setText(str(ok))
+        self._lbl_stat_ng.setText(str(ng))
 
     def _delete_selected(self):
         selected_rows = list({idx.row() for idx in self._table.selectedIndexes()})
@@ -1607,6 +1953,15 @@ class QueryPage(QWidget):
                 except ValueError:
                     pass
         if ids:
+            reply = QMessageBox.question(
+                self,
+                "确认删除",
+                f"确定要删除选中的 {len(ids)} 条测试记录吗？此操作不可恢复。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
             TestDB.delete_by_ids(ids)
             self._do_query()
             InfoBar.success(
@@ -1694,7 +2049,7 @@ class ParamSettingPage(QWidget):
         vh.addWidget(ToolButton(FIF.INFO))
         vh.addWidget(StrongBodyLabel("期望版本号"))
         vh.addStretch()
-        vh.addWidget(CaptionLabel("查询到版本后与此对比，显示 ? 或 ?"))
+        vh.addWidget(CaptionLabel("查询到版本后与此对比，显示 绿色 或 红色"))
         vl.addLayout(vh)
         vl.addWidget(_sep())
 
@@ -1744,7 +2099,7 @@ class ParamSettingPage(QWidget):
         self._sp_loop.setRange(1, 255)
         self._sp_loop.setValue(_APP_CFG.get("loop_count"))
         self._sp_loop.setSuffix("  次")
-        self._sp_loop.setFixedWidth(130)
+        self._sp_loop.setFixedWidth(160)
         self._sp_loop.valueChanged.connect(lambda v: _APP_CFG.set("loop_count", v))
         rr1.addWidget(self._sp_loop)
         rl.addLayout(rr1)
@@ -1756,12 +2111,61 @@ class ParamSettingPage(QWidget):
         self._sp_delay.setRange(50, 9999)
         self._sp_delay.setValue(_APP_CFG.get("unload_delay_ms"))
         self._sp_delay.setSuffix("  ms")
-        self._sp_delay.setFixedWidth(150)
+        self._sp_delay.setFixedWidth(170)
         self._sp_delay.valueChanged.connect(lambda v: _APP_CFG.set("unload_delay_ms", v))
         rr2.addWidget(self._sp_delay)
         rl.addLayout(rr2)
 
         root.addWidget(rc)
+
+        # 电流合格范围卡片
+        cc = _card()
+        cl = QVBoxLayout(cc)
+        cl.setContentsMargins(24, 18, 24, 18)
+        cl.setSpacing(12)
+        cch = QHBoxLayout()
+        cch.addWidget(ToolButton(FIF.SPEED_HIGH))
+        cch.addWidget(StrongBodyLabel("电流合格范围"))
+        cch.addStretch()
+        cch.addWidget(CaptionLabel("单位：A，测试时按最大电流判断是否合格"))
+        cl.addLayout(cch)
+        cl.addWidget(_sep())
+        _motor_names = ["桨叶1", "桨叶2", "插销1", "插销2", "总电流"]
+        _motor_keys  = ["m1", "m2", "m3", "m4", "total"]
+        self._sp_cur = {}
+        for _mname, _mkey in zip(_motor_names, _motor_keys):
+            _crow = QHBoxLayout()
+            _crow.addWidget(BodyLabel(_mname))
+            _crow.addStretch()
+            _sp_min = QDoubleSpinBox()
+            _max_range = round(sample_to_amp(262140 if _mkey == "total" else 65535), 3)
+            _sp_min.setDecimals(3)
+            _sp_min.setSingleStep(0.100)
+            _sp_min.setRange(0, _max_range)
+            _sp_min.setValue(_APP_CFG.get(f"{_mkey}_min"))
+            _sp_min.setFixedWidth(150)
+            _sp_min.setSuffix("  A")
+            _sp_min.valueChanged.connect(
+                (lambda k: lambda v: _APP_CFG.set(k, v))(f"{_mkey}_min")
+            )
+            _crow.addWidget(CaptionLabel("min:"))
+            _crow.addWidget(_sp_min)
+            _crow.addSpacing(10)
+            _sp_max = QDoubleSpinBox()
+            _sp_max.setDecimals(3)
+            _sp_max.setSingleStep(0.100)
+            _sp_max.setRange(0, _max_range)
+            _sp_max.setValue(_APP_CFG.get(f"{_mkey}_max"))
+            _sp_max.setFixedWidth(150)
+            _sp_max.setSuffix("  A")
+            _sp_max.valueChanged.connect(
+                (lambda k: lambda v: _APP_CFG.set(k, v))(f"{_mkey}_max")
+            )
+            _crow.addWidget(CaptionLabel("max:"))
+            _crow.addWidget(_sp_max)
+            cl.addLayout(_crow)
+            self._sp_cur[_mkey] = (_sp_min, _sp_max)
+        root.addWidget(cc)
 
         # 串口默认卡片
         sc = _card()
