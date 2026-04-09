@@ -384,6 +384,8 @@ class AppConfig:
         "m4_max":          round(sample_to_amp(9999), 3),
         "total_min":       0.0,
         "total_max":       round(sample_to_amp(262140), 3),
+        "test_dur_min":    0,
+        "test_dur_max":    120,
     }
 
     def __init__(self):
@@ -602,6 +604,12 @@ class ControlPage(QWidget):
         self._ver_inner_timer.setSingleShot(True)
         self._ver_inner_timer.timeout.connect(self._on_ver_inner_timeout)
 
+        # 测试前标定状态检查
+        self._pending_test_start = False
+        self._pre_test_timer = QTimer(self)
+        self._pre_test_timer.setSingleShot(True)
+        self._pre_test_timer.timeout.connect(self._on_pre_test_timeout)
+
         self._build()
         self._apply_connection_state(False)
 
@@ -626,8 +634,8 @@ class ControlPage(QWidget):
         main_row = QHBoxLayout()
         main_row.setSpacing(10)
         main_row.addWidget(self._build_calib_card(), 2)
-        main_row.addWidget(self._build_test_card(), 2)
-        main_row.addWidget(self._build_loop_card(), 2)
+        main_row.addWidget(self._build_test_card(), 3)
+        main_row.addWidget(self._build_loop_card(), 1)
         main_row.addWidget(self._build_action_card(), 1)
         root.addLayout(main_row)
 
@@ -717,11 +725,17 @@ class ControlPage(QWidget):
 
         # 五路实时电流 + 最大值（含总电流）
         motor_names = ["桨叶1", "桨叶2", "插销1", "插销2", "总电流"]
-        self._lbl_cur_rt  = []
-        self._lbl_cur_max = []
-        for mname in motor_names:
+        motor_keys  = ["m1",   "m2",   "m3",   "m4",   "total"]
+        self._lbl_cur_rt    = []
+        self._lbl_cur_max   = []
+        self._lbl_cur_range = []
+        for mname, mkey in zip(motor_names, motor_keys):
             row = QHBoxLayout()
             row.addWidget(CaptionLabel(mname))
+            rng = CaptionLabel("—")
+            rng.setStyleSheet("color: #94a3b8;")
+            row.addWidget(rng)
+            self._lbl_cur_range.append(rng)
             row.addStretch()
             rt = BodyLabel("--- A")
             rt.setStyleSheet("color: #3b82f6;")
@@ -733,6 +747,18 @@ class ControlPage(QWidget):
             row.addWidget(mx)
             self._lbl_cur_max.append(mx)
             lay.addLayout(row)
+
+        # 时长行
+        dur_row = QHBoxLayout()
+        dur_row.addWidget(CaptionLabel("测试时长"))
+        self._lbl_dur_range = CaptionLabel("—")
+        self._lbl_dur_range.setStyleSheet("color: #94a3b8;")
+        dur_row.addWidget(self._lbl_dur_range)
+        dur_row.addStretch()
+        self._lbl_dur_rt = BodyLabel("--- s")
+        self._lbl_dur_rt.setStyleSheet("color: #3b82f6;")
+        dur_row.addWidget(self._lbl_dur_rt)
+        lay.addLayout(dur_row)
 
         lay.addWidget(_sep())
 
@@ -766,6 +792,8 @@ class ControlPage(QWidget):
         self._btn_test_stop.clicked.connect(self._stop_test_action)
         btn_row.addWidget(self._btn_test_stop, 2)
         lay.addLayout(btn_row)
+        # 初始化范围标签
+        self._refresh_test_ranges()
         return card
 
     # ── 循环运行卡片 ───────────────────────────────
@@ -1266,20 +1294,55 @@ class ControlPage(QWidget):
         )
 
     # ── 电流测试逻辑 ──────────────────────────────
+    def _refresh_test_ranges(self):
+        """刷新测试卡片上的范围标签（从当前配置读取）"""
+        keys = ["m1", "m2", "m3", "m4", "total"]
+        for i, k in enumerate(keys):
+            lo = _APP_CFG.get(f"{k}_min")
+            hi = _APP_CFG.get(f"{k}_max")
+            self._lbl_cur_range[i].setText(f"{lo:.3f}~{hi:.3f} A")
+        dur_min = _APP_CFG.get("test_dur_min")
+        dur_max = _APP_CFG.get("test_dur_max")
+        self._lbl_dur_range.setText(f"{dur_min}~{dur_max} s")
+
     def _start_test(self):
-        if self._testing or self._calibrating or self._loop_running:
+        """点击「开始测试」→ 先查询标定状态，确认成功再真正启动"""
+        if self._testing or self._calibrating or self._loop_running or self._pending_test_start:
             return
+        self._pending_test_start = True
+        self._btn_test_start.setEnabled(False)
+        self._lbl_test_status.setText("查询标定...")
+        self._lbl_test_status.setStyleSheet("color: #718096;")
+        self._send(CMD_QUERY_STATUS, "测试前-查询标定状态")
+        self._pre_test_timer.start(3000)
+
+    def _on_pre_test_timeout(self):
+        """查询标定状态超时（3s无响应）"""
+        self._pending_test_start = False
+        self._lbl_test_status.setText("待  机")
+        self._lbl_test_status.setStyleSheet("color: #718096;")
+        self._update_start_buttons()
+        QMessageBox.warning(
+            self, "无法开始测试",
+            "查询标定状态超时，设备未响应。\n请确认设备已连接并完成标定后重试。"
+        )
+
+    def _do_start_test(self):
+        """标定确认完成后真正启动测试流程"""
         self._testing       = True
         self._test_start    = time.monotonic()
         self._test_start_dt = QDateTime.currentDateTime()
         self._test_tick     = 0
         self._test_currents = [[], [], [], [], []]
+        # 刷新标准范围显示
+        self._refresh_test_ranges()
         # 重置 UI
         for i in range(5):
             self._lbl_cur_rt[i].setText("--- A")
             self._lbl_cur_rt[i].setStyleSheet("color: #3b82f6;")
             self._lbl_cur_max[i].setText("max:--- A")
             self._lbl_cur_max[i].setStyleSheet("color: #718096;")
+        self._lbl_dur_rt.setText("--- s")
         self._ring_test.setRingColor(QColor("#d97706"))
         self._ring_test.setValue(0)
         self._ring_test.setText("测试中")
@@ -1324,6 +1387,7 @@ class ControlPage(QWidget):
         pct = int(elapsed_ms * 100 / (TEST_TIMEOUT_S * 1000))
         self._test_bar.setValue(min(elapsed, TEST_TIMEOUT_S))
         self._ring_test.setValue(min(pct, 100))
+        self._lbl_dur_rt.setText(f"{elapsed} s")
         if elapsed_ms >= TEST_TIMEOUT_S * 1000:
             self._lbl_test_status.setText("超  时")
             self._lbl_test_status.setStyleSheet("color: #e53e3e; font-weight: bold;")
@@ -1367,8 +1431,17 @@ class ControlPage(QWidget):
             (_APP_CFG.get("m4_min"), _APP_CFG.get("m4_max")),
             (_APP_CFG.get("total_min"), _APP_CFG.get("total_max")),
         ]
-        ok = all(lo <= maxvals[i] <= hi for i, (lo, hi) in enumerate(thresholds))
+        current_ok = all(lo <= maxvals[i] <= hi for i, (lo, hi) in enumerate(thresholds))
+        # 时长判断
+        duration_s = round(time.monotonic() - self._test_start, 1)
+        dur_min = _APP_CFG.get("test_dur_min")
+        dur_max = _APP_CFG.get("test_dur_max")
+        dur_ok = (dur_min <= duration_s <= dur_max)
+        ok = current_ok and dur_ok
         result = "OK" if ok else "NG"
+        # 更新时长显示颜色
+        self._lbl_dur_rt.setText(f"{duration_s} s")
+        self._lbl_dur_rt.setStyleSheet("color: #22c55e; font-weight: bold;" if dur_ok else "color: #ef4444; font-weight: bold;")
         # 更新最大值颜色
         for i, (lo, hi) in enumerate(thresholds):
             in_range = (lo <= maxvals[i] <= hi)
@@ -1392,21 +1465,27 @@ class ControlPage(QWidget):
         # 测试完成后清除二维码，等待下次扫码
         self._qr.clear_code()
         self._qr_scanned = False
+        ng_reason = []
+        if not current_ok:
+            ng_reason.append("电流超范围")
+        if not dur_ok:
+            ng_reason.append(f"时长 {duration_s}s 不在 {dur_min}~{dur_max}s 范围")
         log(
             f"电流测试完成: {result}  桨叶1={format_amp(maxvals[0])}  桨叶2={format_amp(maxvals[1])}"
-            f"  插销1={format_amp(maxvals[2])}  插销2={format_amp(maxvals[3])}  总电流={format_amp(maxvals[4])}",
-            "success"
+            f"  插销1={format_amp(maxvals[2])}  插销2={format_amp(maxvals[3])}  总电流={format_amp(maxvals[4])}"
+            f"  时长={duration_s}s",
+            "success" if ok else "error"
         )
         if ok:
             InfoBar.success(
-                title="测试合格 OK", content="电流在合格范围内，自动开始循环运行。",
+                title="测试合格 OK", content="电流及时长均在合格范围内，自动开始循环运行。",
                 orient=Qt.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP, duration=4000, parent=self,
             )
             QTimer.singleShot(800, self._start_loop)
         else:
             InfoBar.error(
-                title="测试不合格 NG", content="电流超出合格范围，请检查设备。",
+                title="测试不合格 NG", content="、".join(ng_reason) + "，请检查设备。",
                 orient=Qt.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP, duration=5000, parent=self,
             )
@@ -1539,6 +1618,22 @@ class ControlPage(QWidget):
             loop_cnt = data[8] | (data[9] << 8)
             calib_map = {0: "未标定", 1: "标定中", 2: "标定成功", 3: "标定失败"}
             log(f"状态: 标定={calib_map.get(calib_st, hex(calib_st))}  循环次数={loop_cnt}", "info")
+            # 测试前标定状态检查
+            if self._pending_test_start:
+                self._pre_test_timer.stop()
+                self._pending_test_start = False
+                if calib_st == 2:
+                    self._do_start_test()
+                else:
+                    calib_desc = calib_map.get(calib_st, hex(calib_st))
+                    self._lbl_test_status.setText("待  机")
+                    self._lbl_test_status.setStyleSheet("color: #718096;")
+                    self._update_start_buttons()
+                    QMessageBox.warning(
+                        self, "无法开始测试",
+                        f"设备标定状态为「{calib_desc}」，\n请先完成标定再执行测试。"
+                    )
+                return
             if self._calibrating:
                 if calib_st == 2:
                     self._on_calibration_done()
@@ -2144,6 +2239,32 @@ class ParamSettingPage(QWidget):
         self._sp_delay.valueChanged.connect(lambda v: _APP_CFG.set("unload_delay_ms", v))
         rr2.addWidget(self._sp_delay)
         rl.addLayout(rr2)
+
+        rl.addWidget(_sep())
+        rl.addWidget(CaptionLabel("测试时长合格范围（测试完成时检查总耗时是否在此范围内）"))
+        rr3 = QHBoxLayout()
+        rr3.addWidget(BodyLabel("测试时长最短"))
+        rr3.addStretch()
+        self._sp_dur_min = SpinBox()
+        self._sp_dur_min.setRange(0, 9999)
+        self._sp_dur_min.setValue(_APP_CFG.get("test_dur_min"))
+        self._sp_dur_min.setSuffix("  s")
+        self._sp_dur_min.setFixedWidth(150)
+        self._sp_dur_min.valueChanged.connect(lambda v: _APP_CFG.set("test_dur_min", v))
+        rr3.addWidget(self._sp_dur_min)
+        rl.addLayout(rr3)
+
+        rr4 = QHBoxLayout()
+        rr4.addWidget(BodyLabel("测试时长最长"))
+        rr4.addStretch()
+        self._sp_dur_max = SpinBox()
+        self._sp_dur_max.setRange(1, 9999)
+        self._sp_dur_max.setValue(_APP_CFG.get("test_dur_max"))
+        self._sp_dur_max.setSuffix("  s")
+        self._sp_dur_max.setFixedWidth(150)
+        self._sp_dur_max.valueChanged.connect(lambda v: _APP_CFG.set("test_dur_max", v))
+        rr4.addWidget(self._sp_dur_max)
+        rl.addLayout(rr4)
 
         root.addWidget(rc)
 
