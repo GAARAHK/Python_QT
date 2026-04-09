@@ -61,6 +61,7 @@ CALIB_TIMEOUT_S  = 120
 LOOP_POLL_MS     = 1000
 TEST_POLL_MS     = 500
 TEST_TIMEOUT_S   = 120
+LIN_ENABLE_DELAY_MS = 200
 LOG_MAX_LINES    = 1500
 LOG_TRIM_TO      = 1000
 CURRENT_SCALE_A  = 0.001614557239479
@@ -594,6 +595,13 @@ class ControlPage(QWidget):
         self._test_timer = QTimer(self)
         self._test_timer.timeout.connect(self._on_test_poll)
 
+        self._ver_outer_timer = QTimer(self)
+        self._ver_outer_timer.setSingleShot(True)
+        self._ver_outer_timer.timeout.connect(self._on_ver_outer_timeout)
+        self._ver_inner_timer = QTimer(self)
+        self._ver_inner_timer.setSingleShot(True)
+        self._ver_inner_timer.timeout.connect(self._on_ver_inner_timeout)
+
         self._build()
         self._apply_connection_state(False)
 
@@ -1091,13 +1099,33 @@ class ControlPage(QWidget):
 
     def _send_with_lin(self, cmd: bytes, label: str):
         self._send(CMD_ENABLE_LIN, "启用LIN控制")
-        self._send(cmd, label)
+        QTimer.singleShot(LIN_ENABLE_DELAY_MS, lambda: self._send(cmd, label))
 
     def _query_version_outer(self):
+        self._lbl_ver_outer.setText("查询中...")
+        self._lbl_ver_outer.setStyleSheet("color: #718096;")
+        self._lbl_ver_outer_match.setText("")
+        self._ver_outer_timer.start(3000)
         self._send_with_lin(CMD_QUERY_VER, "查询外部版本")
 
     def _query_version_inner(self):
+        self._lbl_ver_inner.setText("查询中...")
+        self._lbl_ver_inner.setStyleSheet("color: #718096;")
+        self._lbl_ver_inner_match.setText("")
+        self._ver_inner_timer.start(3000)
         self._send_with_lin(CMD_QUERY_INNER_VER, "查询内部版本")
+
+    def _on_ver_outer_timeout(self):
+        self._lbl_ver_outer.setText("查询失败")
+        self._lbl_ver_outer.setStyleSheet("color: #ef4444; font-weight: bold;")
+        self._lbl_ver_outer_match.setText("")
+        log("外部版本查询超时，未收到设备响应", "warning")
+
+    def _on_ver_inner_timeout(self):
+        self._lbl_ver_inner.setText("查询失败")
+        self._lbl_ver_inner.setStyleSheet("color: #ef4444; font-weight: bold;")
+        self._lbl_ver_inner_match.setText("")
+        log("内部版本查询超时，未收到设备响应", "warning")
 
     def _send_unfold(self):
         self._send(CMD_UNFOLD, "同步展开")
@@ -1132,8 +1160,7 @@ class ControlPage(QWidget):
             return
         self._worker.send(CMD_ENABLE_LIN)
         log(f"TX [紧急停止-启用LIN]  {to_hex(CMD_ENABLE_LIN)}", "tx")
-        self._worker.send(CMD_POWER_CYCLE)
-        log(f"TX [紧急停止]  {to_hex(CMD_POWER_CYCLE)}", "tx")
+        QTimer.singleShot(LIN_ENABLE_DELAY_MS, lambda: self._send(CMD_POWER_CYCLE, "紧急停止"))
         InfoBar.error(
             title="紧急停止！", content="断电重启指令已发送！",
             orient=Qt.Horizontal, isClosable=True,
@@ -1536,6 +1563,7 @@ class ControlPage(QWidget):
                 self._on_test_current([m1, m2, m3, m4])
 
         elif cmd_byte == RESP_CMD_INNER_VER:
+            self._ver_inner_timer.stop()
             # byte[4]=0x33前缀, byte[5:11]=6位版本数字 → "1.4.1.004"
             raw = "".join(chr(b) for b in data[5:11] if 0x30 <= b <= 0x39)
             if len(raw) >= 6:
@@ -1565,6 +1593,7 @@ class ControlPage(QWidget):
                 log(f"内部版本: {ver}", "success")
 
         elif cmd_byte == RESP_CMD_OUTER_VER:
+            self._ver_outer_timer.stop()
             # byte[4]=0x33前缀, byte[5:8]=3位版本数字 → "1.4.1"
             raw = "".join(chr(b) for b in data[5:8] if 0x30 <= b <= 0x39)
             if len(raw) >= 3:
